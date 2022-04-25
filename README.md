@@ -18,4 +18,9 @@ The first part of the code comes from the GitHub repo [YuvalNirkin](https://gith
 
 
 ## Installation
-Please refer to the link above for detailed installation guide. Please note that the author requires to fill out [this form](https://docs.google.com/forms/d/e/1FAIpQLScyyNWoFvyaxxfyaPLnCIAxXgdxLEMwR9Sayjh3JpWseuYlOA/viewform?usp=sf_link) to gain access to the weight files used in this project. 
+Please refer to the link above for detailed installation guide. Please note that the author requires to fill out [this form](https://docs.google.com/forms/d/e/1FAIpQLScyyNWoFvyaxxfyaPLnCIAxXgdxLEMwR9Sayjh3JpWseuYlOA/viewform?usp=sf_link) to gain access to the weight files used in this project.
+
+After obtaining access to the paper models, please run "python download_fsgan_models.py -m v1" and make sure the weight files are under the correct path.
+
+## FSGAN Inference
+Please follow the link at: https://github.com/YuvalNirkin/fsgan/wiki/Paper-Models-Inference
