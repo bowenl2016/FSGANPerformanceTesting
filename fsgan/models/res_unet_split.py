@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from fsgan.utils.img_utils import create_pyramid
 
 
@@ -247,10 +248,8 @@ class ResUNet(nn.Module):
         return tuple(output)
 
 
-# x |-- in_conv --| ----identity---- |-- flat --|
-# y |-------------| -- upsampling -- |
 class LocalEnhancer(nn.Module):
-    """ Defines the architecture of the local enhancer described in:
+    """ Define the architecture of the local enhancer described in:
     `"High-Resolution Image Synthesis and Semantic Manipulation with Conditional GANs
     <https://arxiv.org/pdf/1711.11585.pdf>`_.
 
@@ -272,14 +271,14 @@ class LocalEnhancer(nn.Module):
                  flat_layers=0, padding_type='reflect', norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU(inplace=True),
                  use_dropout=False):
         super(LocalEnhancer, self).__init__()
-        self.in_conv = nn.Sequential(*make_conv_block(in_nc, ngf, kernel_size=7, norm_layer=norm_layer,
-                                                      act_layer=act_layer, use_dropout=use_dropout))
-        self.up_block = up_block(sub_ngf, ngf, 3, padding_type, norm_layer, act_layer)
+        self.down_block = down_block(ngf, sub_ngf, 3, padding_type, norm_layer, act_layer)
         if flat_block is not None:
-            # self.flat_block = flat_block(sub_ngf, 3, flat_layers, padding_type, norm_layer, act_layer)
-            self.flat_block = flat_block(ngf, 3, flat_layers, padding_type, norm_layer, act_layer)
+            self.flat_block = flat_block(sub_ngf, 3, flat_layers, padding_type, norm_layer, act_layer)
         else:
             self.flat_block = None
+        self.up_block = up_block(sub_ngf, ngf, 3, padding_type, norm_layer, act_layer)
+        self.in_conv = nn.Sequential(*make_conv_block(in_nc, ngf, kernel_size=7, norm_layer=norm_layer,
+                                                      act_layer=act_layer, use_dropout=use_dropout))
 
         # Output convolutions
         for i in range(len(out_nc)):
@@ -288,8 +287,11 @@ class LocalEnhancer(nn.Module):
             self.add_module('out_conv%d' % (i + 1), nn.Sequential(*out_conv))
 
     def extract_features(self, x, y):
-        x = self.in_conv(x) + self.up_block(y)
-        x = self.flat_block(x) if self.flat_block is not None else x
+        x = self.in_conv(x)
+        x = self.down_block(x) + y
+        if self.flat_block is not None:
+            x = self.flat_block(x)
+        x = self.up_block(x)
 
         return x
 
@@ -317,14 +319,14 @@ class MultiScaleResUNet(nn.Module):
         out_nc (tuple of ints): Output number of channels for each head
         max_nc (int): Maximum number of channels of the intermediate layers
         ngf (int): Number of input and output channels
-        flat_layers (tuple of ints): Number of layers in each flat block
+        flat_layers (list of ints): Number of layers in each flat block
         norm_layer (nn.Module): Type of feature normalization layer
         act_layer (nn.Module): Type of activation layer
         use_dropout (bool): If True, enables dropout with probability 0.5
         n_local_enhancers (int): Number of local enhancers
     """
     def __init__(self, down_block=DownBlock, up_block=UpBlock, flat_block=FlatBlock, in_nc=3, out_nc=(3,),
-                 max_nc=1024, ngf=64, flat_layers=(0, 0, 0, 3), norm_layer=nn.BatchNorm2d,
+                 max_nc=None, ngf=64, flat_layers=(0, 0, 0, 3), norm_layer=nn.BatchNorm2d,
                  act_layer=nn.ReLU(inplace=True), use_dropout=False, n_local_enhancers=1):
         super(MultiScaleResUNet, self).__init__()
         self.in_nc = in_nc
@@ -338,9 +340,8 @@ class MultiScaleResUNet(nn.Module):
 
         # Local enhancers
         for n in range(1, n_local_enhancers + 1):
-            curr_ngf = min(ngf * (2 ** (n_local_enhancers - n)), max_nc)
-            curr_sub_ngf = min(curr_ngf * 2, max_nc)
-            enhancer = LocalEnhancer(curr_ngf, curr_sub_ngf, down_block, up_block, flat_block, in_nc, out_nc,
+            curr_ngf = ngf * (2**(n_local_enhancers-n))
+            enhancer = LocalEnhancer(curr_ngf, curr_ngf * 2, down_block, up_block, flat_block, in_nc, out_nc,
                                      flat_layers[n - 1], 'reflect', norm_layer, act_layer, use_dropout)
             self.add_module('enhancer%d' % n, enhancer)
 
@@ -358,6 +359,7 @@ class MultiScaleResUNet(nn.Module):
         # Apply enhancer for each level
         for n in range(1, len(pyd)):
             enhancer = getattr(self, 'enhancer%d' % n)
+            # x = enhancer(pyd[self.n_local_enhancers - n], x)
             x = enhancer.extract_features(pyd[self.n_local_enhancers - n], x)
             if n == self.n_local_enhancers:
                 output = []

@@ -12,7 +12,7 @@ class Hopenet(nn.Module):
     Predicts Euler angles by binning and regression.
 
     Args:
-        block (nn.Module): Main convolution block
+        block (nn.Module): Main convolutions block
         layers (list of ints): Number of blocks per intermediate layer
         num_bins (int): Number of regression bins
     """
@@ -87,8 +87,8 @@ class Hopenet(nn.Module):
             self.idx_tensor = torch.arange(0, 66, out=torch.FloatTensor()).to(x.device)
 
         # Get continuous predictions in degrees.
-        yaw_predicted = torch.sum(yaw_predicted * self.idx_tensor, axis=1).unsqueeze(1) * 3 - 99
-        pitch_predicted = torch.sum(pitch_predicted * self.idx_tensor, axis=1).unsqueeze(1) * 3 - 99
-        roll_predicted = torch.sum(roll_predicted * self.idx_tensor, axis=1).unsqueeze(1) * 3 - 99
+        yaw_predicted = torch.sum(yaw_predicted.data[0] * self.idx_tensor) * 3 - 99
+        pitch_predicted = torch.sum(pitch_predicted.data[0] * self.idx_tensor) * 3 - 99
+        roll_predicted = torch.sum(roll_predicted.data[0] * self.idx_tensor) * 3 - 99
 
-        return torch.cat((yaw_predicted, pitch_predicted, roll_predicted), axis=1)
+        return yaw_predicted, pitch_predicted, roll_predicted

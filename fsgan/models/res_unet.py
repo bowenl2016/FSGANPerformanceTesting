@@ -6,7 +6,7 @@ from fsgan.utils.img_utils import create_pyramid
 
 def make_conv_block(in_nc, out_nc, kernel_size=3, stride=1, padding=None, bias=False, padding_type='reflect',
                     norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU(True), use_dropout=False):
-    """" Defines a convolution block with a normalization layer, an activation layer, and an optional dropout layer.
+    """ Defines a convolution block with a normalization layer, an activation layer, and an optional dropout layer.
 
     Args:
         in_nc (int): Input number of channels
@@ -132,7 +132,7 @@ class FlatBlock(nn.Module):
     Args:
         planes: The input and output number of channels
         kernel_size (int): Convolution kernel size
-        layers: (int): The number of residual blocks
+        layers (int): The number of residual blocks
         padding_type (str): The type of padding to perform ['reflect' | 'replicate' | 'zero']
         norm_layer (nn.Module): Type of feature normalization layer
         act_layer (nn.Module): Type of activation layer
@@ -202,18 +202,16 @@ class ResUNet(nn.Module):
         flat_block (nn.Module): Type of flat block
         in_nc (int): Input number of channels
         out_nc (int): Output number of channels
-        max_nc (int): Maximum number of channels of the intermediate layers
         ngf (int): The number of input channels of the first intermediate layer
         flat_layers (list of ints): Number of layers in each flat block
         norm_layer (nn.Module): Type of feature normalization layer
         act_layer (nn.Module): Type of activation layer
         use_dropout (bool): If True, enables dropout with probability 0.5
     """
-    def __init__(self, down_block=DownBlock, up_block=UpBlock, flat_block=FlatBlock, in_nc=3, out_nc=3, max_nc=None,
-                 ngf=64, flat_layers=(0, 0, 0, 3), norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU(inplace=True),
+    def __init__(self, down_block=DownBlock, up_block=UpBlock, flat_block=FlatBlock, in_nc=3, out_nc=3, ngf=64,
+                 flat_layers=(0, 0, 0, 3), norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU(inplace=True),
                  use_dropout=False):
         super(ResUNet, self).__init__()
-        max_nc = 1000000 if max_nc is None else max_nc
         self.in_nc = in_nc
         self.out_nc = out_nc
         self.in_conv = nn.Sequential(*make_conv_block(in_nc, ngf, kernel_size=7, norm_layer=norm_layer,
@@ -225,9 +223,7 @@ class ResUNet(nn.Module):
         self.levels = len(flat_layers)
         unet_block = None
         for i in range(1, self.levels + 1):
-            curr_ngf = min(ngf * (2 ** (self.levels - i)), max_nc)
-            curr_sub_ngf = min(ngf * (2 ** (self.levels - i + 1)), max_nc)
-            unet_block = SkipConnectionBlock(curr_ngf, curr_sub_ngf,
+            unet_block = SkipConnectionBlock(ngf * (2 ** (self.levels - i)), ngf * (2 ** (self.levels - i + 1)),
                                              down_block, unet_block, up_block, flat_block, flat_layers=flat_layers[-i],
                                              norm_layer=norm_layer, act_layer=act_layer, use_dropout=use_dropout)
         self.inner = unet_block
@@ -240,8 +236,6 @@ class ResUNet(nn.Module):
         return x
 
 
-# x |-- in_conv --| ----identity---- |-- flat --|
-# y |-------------| -- upsampling -- |
 class LocalEnhancer(nn.Module):
     """ Define the architecture of the local enhancer described in:
     `"High-Resolution Image Synthesis and Semantic Manipulation with Conditional GANs
@@ -265,22 +259,24 @@ class LocalEnhancer(nn.Module):
                  flat_layers=0, padding_type='reflect', norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU(inplace=True),
                  use_dropout=False):
         super(LocalEnhancer, self).__init__()
-        self.in_conv = nn.Sequential(*make_conv_block(in_nc, ngf, kernel_size=7, norm_layer=norm_layer,
-                                                      act_layer=act_layer, use_dropout=use_dropout))
-        self.up_block = up_block(sub_ngf, ngf, 3, padding_type, norm_layer, act_layer)
+        self.down_block = down_block(ngf, sub_ngf, 3, padding_type, norm_layer, act_layer)
         if flat_block is not None:
-            # self.flat_block = flat_block(sub_ngf, 3, flat_layers, padding_type, norm_layer, act_layer)
-            self.flat_block = flat_block(ngf, 3, flat_layers, padding_type, norm_layer, act_layer)
+            self.flat_block = flat_block(sub_ngf, 3, flat_layers, padding_type, norm_layer, act_layer)
         else:
             self.flat_block = None
-
+        self.up_block = up_block(sub_ngf, ngf, 3, padding_type, norm_layer, act_layer)
+        self.in_conv = nn.Sequential(*make_conv_block(in_nc, ngf, kernel_size=7, norm_layer=norm_layer,
+                                                      act_layer=act_layer, use_dropout=use_dropout))
         self.out_conv = make_conv_block(ngf, out_nc, kernel_size=7, norm_layer=None, act_layer=None)
         self.out_conv.append(nn.Tanh())
         self.out_conv = nn.Sequential(*self.out_conv)
 
     def extract_features(self, x, y):
-        x = self.in_conv(x) + self.up_block(y)
-        x = self.flat_block(x) if self.flat_block is not None else x
+        x = self.in_conv(x)
+        x = self.down_block(x) + y
+        if self.flat_block is not None:
+            x = self.flat_block(x)
+        x = self.up_block(x)
 
         return x
 
@@ -302,17 +298,16 @@ class MultiScaleResUNet(nn.Module):
         flat_block (nn.Module): Type of flat block
         in_nc (int): Input number of channels
         out_nc (int): Output number of channels
-        max_nc (int): Maximum number of channels of the intermediate layers
         ngf (int): Number of input and output channels
-        flat_layers (tuple of ints): Number of layers in each flat block
+        flat_layers (list of ints): Number of layers in each flat block
         norm_layer (nn.Module): Type of feature normalization layer
         act_layer (nn.Module): Type of activation layer
         use_dropout (bool): If True, enables dropout with probability 0.5
         n_local_enhancers (int): Number of local enhancers
     """
     def __init__(self, down_block=DownBlock, up_block=UpBlock, flat_block=FlatBlock, in_nc=3, out_nc=3,
-                 max_nc=1024, ngf=64, flat_layers=(0, 0, 0, 3), norm_layer=nn.BatchNorm2d,
-                 act_layer=nn.ReLU(inplace=True), use_dropout=False, n_local_enhancers=1):
+                 ngf=64, flat_layers=(0, 0, 0, 3), norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU(inplace=True),
+                 use_dropout=False, n_local_enhancers=1):
         super(MultiScaleResUNet, self).__init__()
         self.in_nc = in_nc
         self.out_nc = out_nc
@@ -320,14 +315,13 @@ class MultiScaleResUNet(nn.Module):
 
         # Global
         ngf_global = ngf * (2 ** n_local_enhancers)
-        self.base = ResUNet(down_block, up_block, flat_block, in_nc, out_nc, max_nc, ngf_global,
+        self.base = ResUNet(down_block, up_block, flat_block, in_nc, out_nc, ngf_global,
                             flat_layers[n_local_enhancers:], norm_layer, act_layer, use_dropout)
 
         # Local enhancers
         for n in range(1, n_local_enhancers + 1):
-            curr_ngf = min(ngf * (2 ** (n_local_enhancers - n)), max_nc)
-            curr_sub_ngf = min(curr_ngf * 2, max_nc)
-            enhancer = LocalEnhancer(curr_ngf, curr_sub_ngf, down_block, up_block, flat_block, in_nc, out_nc,
+            curr_ngf = ngf * (2**(n_local_enhancers-n))
+            enhancer = LocalEnhancer(curr_ngf, curr_ngf * 2, down_block, up_block, flat_block, in_nc, out_nc,
                                      flat_layers[n - 1], 'reflect', norm_layer, act_layer, use_dropout)
             self.add_module('enhancer%d' % n, enhancer)
 

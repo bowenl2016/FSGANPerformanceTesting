@@ -1,18 +1,6 @@
 """ Utility script for overriding the architecture of saved checkpoints. """
 
-import argparse
 import torch
-
-
-parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description=__doc__)
-parser.add_argument('checkpoint_path', metavar='PATH',
-                    help='path to checkpoint file')
-parser.add_argument('-a', '--arch',
-                    help='network architecture')
-parser.add_argument('-o', '--output', metavar='PATH',
-                    help='output checkpoint path')
-parser.add_argument('--override', action='store_true',
-                    help='override existing architecture')
 
 
 def main(checkpoint_path, arch, output=None, override=False):
@@ -28,4 +16,15 @@ def main(checkpoint_path, arch, output=None, override=False):
 
 
 if __name__ == "__main__":
-    main(**vars(parser.parse_args()))
+    # Parse program arguments
+    import argparse
+    parser = argparse.ArgumentParser('Set checkpoint architecture')
+    parser.add_argument('checkpoint_path', metavar='PATH',
+                        help='path to checkpoint file')
+    parser.add_argument('-a', '--arch', type=str, help='network architecture')
+    parser.add_argument('-o', '--output', default=None, metavar='PATH',
+                        help='output checkpoint path')
+    parser.add_argument('--override', action='store_true',
+                        help='override existing architecture')
+    args = parser.parse_args()
+    main(args.checkpoint_path, arch=args.arch, output=args.output, override=args.override)

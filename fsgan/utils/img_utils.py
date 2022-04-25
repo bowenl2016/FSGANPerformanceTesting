@@ -3,8 +3,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.utils
 import torchvision.transforms.functional as F
+import torchvision.utils as vutils
 
 
 def rgb2tensor(img, normalize=True):
@@ -101,10 +101,17 @@ def make_grid(*args, cols=8):
     Returns:
         torch.Tensor: The grid of images.
     """
-    assert len(args) > 0, 'At least one input tensor must be given!'
-    imgs = torch.cat([a.cpu() for a in args], dim=2)
+    if len(args) == 0:
+        raise RuntimeError('At least one input tensor must be given!')
+    step = args[0].shape[0]
+    cols = min(step, cols)
+    imgs = []
+    for d in range(0, args[0].shape[0], cols):
+        for arg in args:
+            for i in range(d, min(d + cols, step)):
+                imgs.append(arg[i])
 
-    return torchvision.utils.make_grid(imgs, nrow=cols, normalize=True, scale_each=False)
+    return vutils.make_grid(imgs, nrow=cols, normalize=True, scale_each=False)
 
 
 def create_pyramid(img, n=1):

@@ -1,223 +1,358 @@
 """ Video utilities. """
 
+import os
+import face_alignment
+import cv2
 import numpy as np
-from itertools import count
-import ffmpeg
-from fsgan.utils.one_euro_filter import OneEuroFilter
+import pickle
+from tqdm import tqdm
+from PIL import Image
+from glob import glob
+import torchvision.transforms.functional as F
+from fsgan.utils.bbox_utils import get_main_bbox
+from fsgan.utils.img_utils import rgb2tensor
+from fsgan.utils.bbox_utils import scale_bbox, crop_img
 
 
-class Sequence(object):
-    """ Represents a sequence of detected faces in a video.
+def extract_landmarks_bboxes_euler_from_video(video_path, face_pose, face_align=None, img_size=(224, 224),
+                                              scale=1.2, device=None, cache_file=None):
+    """ Extract face landmarks, bounding boxes, and pose from video and also read / write them to cache file.
 
     Args:
-        start_index (int): The frame index in the video from which the sequence starts
-        det (np.array): Frame face detections bounding boxes of shape (N, 4), in the format [left, top, right, bottom]
+        video_path (str): Path to video file
+        face_pose (nn.Module): Face pose model
+        face_align (object): Face alignment model
+        img_size (tuple of int): Image crop processing resolution for the face pose model
+        scale (float): Multiplier factor to scale tight bounding box
+        device (torch.device): Processing device
+        cache_file (str): Output cache file path to save the landmarks and bounding boxes in. By default it is saved
+            in the same directory of the video file with the same name and extension .pkl
+
+    Returns:
+        (np.array, np.array, np.array, np.array): Tuple containing:
+            - frame_indices (np.array): The frame indices where a face was detected
+            - landmarks (np.array): Face landmarks per detected face in each frame
+            - bboxes (np.array): Bounding box per detected face in each frame
+            - eulers (np.array): Pose euler angles per detected face in each frame
     """
-    _ids = count(0)
+    # Initialize models
+    if face_align is None:
+        face_align = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=True)
 
-    def __init__(self, start_index, det=None):
-        self.start_index = start_index
-        self.size_sum = 0.
-        self.size_avg = 0.
-        self.id = next(self._ids)
-        self.obj_id = -1
-        self.detections = []
+    #
+    cache_file = os.path.splitext(video_path)[0] + '.pkl' if cache_file is None else cache_file
+    if not os.path.exists(cache_file):
+        frame_indices = []
+        landmarks = []
+        bboxes = []
+        eulers = []
 
-        if det is not None:
-            self.add(det)
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError('Failed to read video: ' + video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    def add(self, det):
-        """ Add new frame detection bounding boxes.
+        # For each frame in the video
+        for i in tqdm(range(total_frames)):
+            ret, frame = cap.read()
+            if frame is None:
+                continue
+            frame_rgb = frame[:, :, ::-1]
+            detected_faces = face_align.face_detector.detect_from_image(frame.copy())
 
-        Args:
-            det (np.array): Frame face detections bounding boxes of shape (N, 4), in the format
-                [left, top, right, bottom]
-        """
-        self.detections.append(det)
-        size = det[3] - det[1]
-        self.size_sum += size
-        self.size_avg = self.size_sum / len(self.detections)
+            # Skip current frame there if no faces were detected
+            if len(detected_faces) == 0:
+                continue
+            curr_bbox = get_main_bbox(np.array(detected_faces)[:, :4], frame.shape[:2])
+            detected_faces = [curr_bbox]
 
-    def smooth(self, kernel_size=7):
-        """ Temporally smooth the detection bounding boxes.
+            preds = face_align.get_landmarks(frame_rgb, detected_faces)
+            curr_landmarks = preds[0]
+            # curr_bbox = detected_faces[0][:4]
 
-        Args:
-            kernel_size (int): The temporal kernel size
-        """
+            # Convert bounding boxes format from [min, max] to [min, size]
+            curr_bbox[2:] = curr_bbox[2:] - curr_bbox[:2] + 1
+
+            # Calculate euler angles
+            scaled_bbox = scale_bbox(curr_bbox, scale)
+            cropped_frame_rgb, cropped_landmarks = crop_img(frame_rgb, curr_landmarks, scaled_bbox)
+            scaled_frame_rgb = np.array(F.resize(Image.fromarray(cropped_frame_rgb), img_size, Image.BICUBIC))
+            scaled_frame_tensor = rgb2tensor(scaled_frame_rgb.copy()).to(device)
+            curr_euler = face_pose(scaled_frame_tensor)  # Yaw, Pitch, Roll
+            curr_euler = np.array([x.cpu().numpy() for x in curr_euler])
+
+
+            ### Debug ###
+            # scaled_frame_bgr = scaled_frame_rgb[:, :, ::-1].copy()
+            # scaled_frame_bgr = draw_axis(scaled_frame_bgr, curr_euler[0], curr_euler[1], curr_euler[2])
+            # cv2.imshow('debug', scaled_frame_bgr)
+            # cv2.waitKey(1)
+            #############
+
+            # Append to list
+            frame_indices.append(i)
+            landmarks.append(curr_landmarks)
+            bboxes.append(curr_bbox)
+            eulers.append(curr_euler)
+
+        # Convert to numpy array format
+        frame_indices = np.array(frame_indices)
+        landmarks = np.array(landmarks)
+        bboxes = np.array(bboxes)
+        eulers = np.array(eulers)
+
+        # if frame_indices.size == 0:
+        #     return frame_indices, landmarks, bboxes
+
         # Prepare smoothing kernel
-        w = np.hamming(kernel_size)
+        kernel_size = 7
+        w = np.hamming(7)
         w /= w.sum()
 
+        # Smooth landmarks
+        orig_shape = landmarks.shape
+        landmarks = landmarks.reshape(landmarks.shape[0], -1)
+        landmarks_padded = np.pad(landmarks, ((kernel_size // 2, kernel_size // 2), (0, 0)), 'reflect')
+        for i in range(landmarks.shape[1]):
+            landmarks[:, i] = np.convolve(w, landmarks_padded[:, i], mode='valid')
+        landmarks = landmarks.reshape(-1, orig_shape[1], orig_shape[2])
+
         # Smooth bounding boxes
-        bboxes = np.array(self.detections)
         bboxes_padded = np.pad(bboxes, ((kernel_size // 2, kernel_size // 2), (0, 0)), 'reflect')
         for i in range(bboxes.shape[1]):
             bboxes[:, i] = np.convolve(w, bboxes_padded[:, i], mode='valid')
 
-        self.detections = bboxes
+        # Smooth target euler angles
+        eulers_padded = np.pad(eulers, ((kernel_size // 2, kernel_size // 2), (0, 0)), 'reflect')
+        for i in range(eulers.shape[1]):
+            eulers[:, i] = np.convolve(w, eulers_padded[:, i], mode='valid')
 
-    def finalize(self):
-        """ Packs all list of added detections into a single numpy array.
+        # Save landmarks and bounding boxes to file
+        with open(cache_file, "wb") as fp:  # Pickling
+            pickle.dump(frame_indices, fp)
+            pickle.dump(landmarks, fp)
+            pickle.dump(bboxes, fp)
+            pickle.dump(eulers, fp)
+    else:
+        # Load landmarks and bounding boxes from file
+        with open(cache_file, "rb") as fp:  # Unpickling
+            frame_indices = pickle.load(fp)
+            landmarks = pickle.load(fp)
+            bboxes = pickle.load(fp)
+            eulers = pickle.load(fp)
 
-        Should be called after all detections were added if smooth was not called.
-        """
-        self.detections = np.array(self.detections)
-
-    def __getitem__(self, index):
-        return self.detections[index]
-
-    def __len__(self):
-        return len(self.detections)
-
-
-# TODO: Remove this
-def estimate_motion(detections, min_cutoff=0.0, beta=3.0, d_cutoff=5.0, fps=30.0):
-    one_euro_filter = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff, t_e=(1.0 / fps))
-    detections_n = np.array(detections)
-    center = np.mean((detections_n[:, 2:] + detections_n[:, :2])*0.5, axis=0)
-    size = np.mean(detections_n[:, 2:] - detections_n[:, :2], axis=0)
-    detections_n = (detections_n - np.concatenate((center, center))) / np.concatenate((size, size))
-
-    motion = []
-    for det in detections_n:
-        det_s, a = one_euro_filter(det)
-        motion.append(a)
-
-    return np.array(motion)
+    return frame_indices, landmarks, bboxes, eulers
 
 
-# TODO: Remove this
-def smooth_detections_avg(detections, kernel_size=7):
-    # Prepare smoothing kernel
-    # w = np.hamming(kernel_size)
-    w = np.ones(kernel_size)
-    w /= w.sum()
+def check_landmarks_bboxes_euler_3d_cache(cache_file):
+    try:
+        with open(cache_file, "rb") as fp:  # Unpickling
+            frame_indices = pickle.load(fp)
+            landmarks = pickle.load(fp)
+            bboxes = pickle.load(fp)
+            eulers = pickle.load(fp)
+            landmarks_3d = pickle.load(fp)
+    except Exception as e:
+        return False
 
-    # Smooth bounding boxes
-    bboxes = np.array(detections)
-    bboxes_padded = np.pad(bboxes, ((kernel_size // 2, kernel_size // 2), (0, 0)), 'reflect')
-    for i in range(bboxes.shape[1]):
-        bboxes[:, i] = np.convolve(w, bboxes_padded[:, i], mode='valid')
-
-    return bboxes
+    return True
 
 
-# TODO: Remove this
-def smooth_detections_1euro(detections, kernel_size=7, min_cutoff=0.0, beta=3.0, d_cutoff=5.0, fps=30.0):
-    detections_np = np.array(detections)
-    detections_avg = smooth_detections_avg(detections, kernel_size)
-    motion = np.expand_dims(estimate_motion(detections, min_cutoff, beta, d_cutoff, fps), 1).astype('float32')
-    out_detections = detections_np * motion + detections_avg * (1 - motion)
-
-    return out_detections
-
-
-# TODO: Remove this
-def smooth_detections_avg_center(detections, center_kernel=11, size_kernel=21):
-    # Prepare smoothing kernel
-    center_w = np.ones(center_kernel)
-    center_w /= center_w.sum()
-    size_w = np.ones(size_kernel)
-    size_w /= size_w.sum()
-
-    # Convert bounding boxes to center and size format
-    bboxes = np.array(detections)
-    centers = (bboxes[:, :2] + bboxes[:, 2:]) / 2.0
-    sizes = bboxes[:, 2:] - bboxes[:, :2]
-
-    # Smooth bounding boxes
-    centers_padded = np.pad(centers, ((center_kernel // 2, center_kernel // 2), (0, 0)), 'reflect')
-    sizes_padded = np.pad(sizes, ((size_kernel // 2, size_kernel // 2), (0, 0)), 'reflect')
-    for i in range(centers.shape[1]):
-        centers[:, i] = np.convolve(center_w, centers_padded[:, i], mode='valid')
-        sizes[:, i] = np.convolve(size_w, sizes_padded[:, i], mode='valid')
-
-    # Change back to detections format
-    sizes /= 2.0
-    bboxes = np.concatenate((centers - sizes, centers + sizes), axis=1)
-
-    return bboxes
-
-
-def get_main_sequence(seq_list, frame_size):
-    """ Return the main sequence in a list of sequences according to their size and how central they are.
+def extract_landmarks_bboxes_euler_3d_from_video(video_path, face_pose, face_align=None, img_size=(224, 224),
+                                                 scale=1.2, device=None, cache_file=None):
+    """ Extract face landmarks, bounding boxes, pose, and 3D face landmarks from video and also read / write them
+    to cache file.
 
     Args:
-        seq_list (list of Sequence): List of sequences
-        frame_size (tuple of int): The corresponding sequence video's frame size of shape (H, W)
+        video_path (str): Path to video file
+        face_pose (nn.Module): Face pose model
+        face_align (object): Face alignment model
+        img_size (tuple of int): Image crop processing resolution for the face pose model
+        scale (float): Multiplier factor to scale tight bounding box
+        device (torch.device): Processing device
+        cache_file (str): Output cache file path to save the landmarks and bounding boxes in. By default it is saved
+            in the same directory of the video file with the same name and extension .pkl
 
     Returns:
-        Sequence: The main sequence.
+        (np.array, np.array, np.array, np.array, np.array): Tuple containing:
+            - frame_indices (np.array): The frame indices where a face was detected
+            - landmarks (np.array): Face landmarks per detected face in each frame
+            - bboxes (np.array): Bounding box per detected face in each frame
+            - eulers (np.array): Pose euler angles per detected face in each frame
+            - landmarks_3d (np.array): 3D face landmarks per detected face in each frame
     """
-    if len(seq_list) == 0:
-        return None
+    # Initialize models
+    if face_align is None:
+        face_align = face_alignment.FaceAlignment(face_alignment.LandmarksType._3D, flip_input=True)
 
-    # Calculate frame max distance and size
-    img_center = np.array([frame_size[1], frame_size[0]]) * 0.5
-    max_dist = 0.25 * np.linalg.norm(frame_size)
-    max_size = 0.25 * (frame_size[0] + frame_size[1])
+    #
+    cache_file = os.path.splitext(video_path)[0] + '.pkl' if cache_file is None else cache_file
+    if not os.path.exists(cache_file) or not check_landmarks_bboxes_euler_3d_cache(cache_file):
+        frame_indices, landmarks, bboxes, eulers = \
+            extract_landmarks_bboxes_euler_from_video(video_path, face_pose, None, img_size, scale, device, cache_file)
+        landmarks_3d = []
 
-    # For each sequence
-    seq_scores = []
-    for seq in seq_list:
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError('Failed to read video: ' + video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # For each detection in the sequence
-        det_scores = []
-        for det in seq:
-            bbox = np.concatenate((det[:2], det[2:] - det[:2]))
+        # For each frame in the video
+        for i in tqdm(range(total_frames)):
+            ret, frame = cap.read()
+            if frame is None:
+                continue
+            frame_rgb = frame[:, :, ::-1]
+            detected_faces = face_align.face_detector.detect_from_image(frame.copy())
 
-            # Calculate center distance
-            bbox_center = bbox[:2] + bbox[2:] * 0.5
-            bbox_dist = np.linalg.norm(bbox_center - img_center)
+            # Skip current frame there if no faces were detected
+            if len(detected_faces) == 0:
+                continue
+            curr_bbox = get_main_bbox(np.array(detected_faces)[:, :4], frame.shape[:2])
+            detected_faces = [curr_bbox]
 
-            # Calculate bbox size
-            bbox_size = bbox[2:].mean()
+            preds = face_align.get_landmarks(frame_rgb, detected_faces)
+            curr_landmarks_3d = preds[0]
 
-            # Calculate central ratio
-            central_ratio = 1.0 if max_size < 1e-6 else (1.0 - bbox_dist / max_dist)
-            central_ratio = np.clip(central_ratio, 0.0, 1.0)
+            # Append to list
+            landmarks_3d.append(curr_landmarks_3d)
 
-            # Calculate size ratio
-            size_ratio = 1.0 if max_size < 1e-6 else (bbox_size / max_size)
-            size_ratio = np.clip(size_ratio, 0.0, 1.0)
+        # Convert to numpy array format
+        landmarks_3d = np.array(landmarks_3d)
 
-            # Add score
-            score = (central_ratio + size_ratio) * 0.5
-            det_scores.append(score)
+        # if frame_indices.size == 0:
+        #     return frame_indices, landmarks, bboxes
 
-        seq_scores.append(np.array(det_scores).mean())
+        # Prepare smoothing kernel
+        kernel_size = 7
+        w = np.hamming(7)
+        w /= w.sum()
 
-    return seq_list[np.argmax(seq_scores)]
+        # Smooth 3D landmarks
+        orig_shape = landmarks_3d.shape
+        landmarks_3d = landmarks_3d.reshape(landmarks_3d.shape[0], -1)
+        landmarks_3d_padded = np.pad(landmarks_3d, ((kernel_size // 2, kernel_size // 2), (0, 0)), 'reflect')
+        for i in range(landmarks_3d.shape[1]):
+            landmarks_3d[:, i] = np.convolve(w, landmarks_3d_padded[:, i], mode='valid')
+        landmarks_3d = landmarks_3d.reshape(-1, orig_shape[1], orig_shape[2])
+
+        # Save landmarks and bounding boxes to file
+        with open(cache_file, "wb") as fp:  # Pickling
+            pickle.dump(frame_indices, fp)
+            pickle.dump(landmarks, fp)
+            pickle.dump(bboxes, fp)
+            pickle.dump(eulers, fp)
+            pickle.dump(landmarks_3d, fp)
+    elif check_landmarks_bboxes_euler_3d_cache(cache_file):
+        # Load landmarks and bounding boxes from file
+        with open(cache_file, "rb") as fp:  # Unpickling
+            frame_indices = pickle.load(fp)
+            landmarks = pickle.load(fp)
+            bboxes = pickle.load(fp)
+            eulers = pickle.load(fp)
+            landmarks_3d = pickle.load(fp)
+
+    return frame_indices, landmarks, bboxes, eulers, landmarks_3d
 
 
-def get_media_info(media_path):
-    """ Return media information.
+def extract_landmarks_bboxes_euler_from_images(img_dir, face_pose, face_align=None, img_size=(224, 224),
+                                              scale=1.2, device=None, cache_file=None):
+    """ Extract face landmarks, bounding boxes, and pose from images and also read / write them to cache file.
 
     Args:
-        media_path (str): Path to media file
+        video_path (str): Path to video file
+        face_pose (nn.Module): Face pose model
+        face_align (object): Face alignment model
+        img_size (tuple of int): Image crop processing resolution for the face pose model
+        scale (float): Multiplier factor to scale tight bounding box
+        device (torch.device): Processing device
+        cache_file (str): Output cache file path to save the landmarks and bounding boxes in. By default it is saved
+            in the same directory of the video file with the same name and extension .pkl
 
     Returns:
-        (int, int, int, float): Tuple containing:
-            - width (int): Frame width
-            - height (int): Frame height
-            - total_frames (int): Total number of frames (will be 1 for images)
-            - fps (float): Frames per second (irrelevant for images)
+        (np.array, np.array, np.array, np.array): Tuple containing:
+            - frame_indices (np.array): The frame indices where a face was detected
+            - landmarks (np.array): Face landmarks per detected face in each frame
+            - bboxes (np.array): Bounding box per detected face in each frame
+            - eulers (np.array): Pose euler angles per detected face in each frame
     """
-    probe = ffmpeg.probe(media_path)
-    video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
-    width = int(video_stream['width'])
-    height = int(video_stream['height'])
-    total_frames = int(video_stream['nb_frames']) if 'nb_frames' in video_stream else 1
-    fps_part1, fps_part2 = video_stream['r_frame_rate'].split(sep='/')
-    fps = float(fps_part1) / float(fps_part2)
+    # Initialize models
+    if face_align is None:
+        face_align = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=True)
 
-    return width, height, total_frames, fps
+    #
+    cache_file = img_dir + '.pkl' if cache_file is None else cache_file
+    if not os.path.exists(cache_file):
+        frame_indices = []
+        landmarks = []
+        bboxes = []
+        eulers = []
 
+        # Parse images
+        img_paths = glob(os.path.join(img_dir, '*.jpg'))
 
-def get_media_resolution(media_path):
-    return get_media_info(media_path)[:2]
+        # For each image in the directory
+        for i, img_path in tqdm(enumerate(img_paths), unit='images', total=len(img_paths)):
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                continue
+            img_rgb = img_bgr[:, :, ::-1]
+            detected_faces = face_align.face_detector.detect_from_image(img_bgr.copy())
 
+            # Skip current frame there if no faces were detected
+            if len(detected_faces) == 0:
+                continue
+            curr_bbox = get_main_bbox(np.array(detected_faces)[:, :4], img_bgr.shape[:2])
+            detected_faces = [curr_bbox]
 
-# TODO: Remove this
-def get_video_info(vid_path):
-    return get_media_info(vid_path)
+            preds = face_align.get_landmarks(img_rgb, detected_faces)
+            curr_landmarks = preds[0]
+            # curr_bbox = detected_faces[0][:4]
+
+            # Convert bounding boxes format from [min, max] to [min, size]
+            curr_bbox[2:] = curr_bbox[2:] - curr_bbox[:2] + 1
+
+            # Calculate euler angles
+            scaled_bbox = scale_bbox(curr_bbox, scale)
+            cropped_frame_rgb, cropped_landmarks = crop_img(img_rgb, curr_landmarks, scaled_bbox)
+            scaled_frame_rgb = np.array(F.resize(Image.fromarray(cropped_frame_rgb), img_size, Image.BICUBIC))
+            scaled_frame_tensor = rgb2tensor(scaled_frame_rgb.copy()).to(device)
+            curr_euler = face_pose(scaled_frame_tensor)  # Yaw, Pitch, Roll
+            curr_euler = np.array([x.cpu().numpy() for x in curr_euler])
+
+            ### Debug ###
+            # scaled_frame_bgr = scaled_frame_rgb[:, :, ::-1].copy()
+            # scaled_frame_bgr = draw_axis(scaled_frame_bgr, curr_euler[0], curr_euler[1], curr_euler[2])
+            # cv2.imshow('debug', scaled_frame_bgr)
+            # cv2.waitKey(1)
+            #############
+
+            # Append to list
+            frame_indices.append(i)
+            landmarks.append(curr_landmarks)
+            bboxes.append(curr_bbox)
+            eulers.append(curr_euler)
+
+        # Convert to numpy array format
+        frame_indices = np.array(frame_indices)
+        landmarks = np.array(landmarks)
+        bboxes = np.array(bboxes)
+        eulers = np.array(eulers)
+
+        # Save landmarks and bounding boxes to file
+        with open(cache_file, "wb") as fp:  # Pickling
+            pickle.dump(frame_indices, fp)
+            pickle.dump(landmarks, fp)
+            pickle.dump(bboxes, fp)
+            pickle.dump(eulers, fp)
+    else:
+        # Load landmarks and bounding boxes from file
+        with open(cache_file, "rb") as fp:  # Unpickling
+            frame_indices = pickle.load(fp)
+            landmarks = pickle.load(fp)
+            bboxes = pickle.load(fp)
+            eulers = pickle.load(fp)
+
+    return frame_indices, landmarks, bboxes, eulers

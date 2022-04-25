@@ -1,12 +1,8 @@
 """ Face segmentation utilities. """
 
-import io
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import cv2
-from PIL import Image
 
 
 def blend_seg_pred(img, seg, alpha=0.5):
@@ -145,124 +141,16 @@ def random_hair_inpainting_mask_tensor(face_mask):
     return torch.cat(out_tensors, dim=0)
 
 
-# TODO: Remove this later
-def encode_segmentation(segmentation):
-    seg_min, seg_max = segmentation.min(), segmentation.max()
-    segmentation = segmentation.sub(seg_min).div_((seg_max - seg_min) * 0.5).sub_(1.0)
-
-    return segmentation
-
-
-def encode_binary_mask(mask):
-    """ Encode binary mask using binary PNG encoding.
-
-    Args:
-        mask (np.array): Binary mask of shape (H, W)
-
-    Returns:
-        bytes: Encoded binary mask.
-    """
-    mask_pil = Image.fromarray(mask.astype('uint8') * 255, mode='L').convert('1')
-    in_mem_file = io.BytesIO()
-    mask_pil.save(in_mem_file, format='png')
-    in_mem_file.seek(0)
-
-    return in_mem_file.read()
-
-
-def decode_binary_mask(bytes):
-    """ Decode an encoded binary mask.
-
-    Args:
-        bytes: Encoded binary mask of shape (H, W)
-
-    Returns:
-        np.array: Decoded binary mask.
-    """
-    return np.array(Image.open(io.BytesIO(bytes)))
-    # return np.array(Image.open(io.BytesIO(bytes)).convert('L'))
-
-
-class SoftErosion(nn.Module):
-    """ Applies *soft erosion* on a binary mask, that is similar to the
-    `erosion morphology operation <https://en.wikipedia.org/wiki/Erosion_(morphology)>`_,
-    returning both a soft mask and a hard binary mask.
-
-    All values greater or equal to the the specified threshold will be set to 1 in both the soft and hard masks,
-    the other values will be 0 in the hard mask and will be gradually reduced to 0 in the soft mask.
-
-    Args:
-        kernel_size (int): The size of the erosion kernel size
-        threshold (float): The erosion threshold
-        iterations (int) The number of times to apply the erosion kernel
-    """
-    def __init__(self, kernel_size=15, threshold=0.6, iterations=1):
-        super(SoftErosion, self).__init__()
-        r = kernel_size // 2
-        self.padding = r
-        self.iterations = iterations
-        self.threshold = threshold
-
-        # Create kernel
-        y_indices, x_indices = torch.meshgrid(torch.arange(0., kernel_size), torch.arange(0., kernel_size))
-        dist = torch.sqrt((x_indices - r) ** 2 + (y_indices - r) ** 2)
-        kernel = dist.max() - dist
-        kernel /= kernel.sum()
-        kernel = kernel.view(1, 1, *kernel.shape)
-        self.register_buffer('weight', kernel)
-
-    def forward(self, x):
-        """ Apply the soft erosion operation.
-
-        Args:
-            x (torch.Tensor): A binary mask of shape (1, H, W)
-
-        Returns:
-            (torch.Tensor, torch.Tensor): Tuple containing:
-                - soft_mask (torch.Tensor): The soft mask of shape (1, H, W)
-                - hard_mask (torch.Tensor): The hard mask of shape (1, H, W)
-        """
-        x = x.float()
-        for i in range(self.iterations - 1):
-            x = torch.min(x, F.conv2d(x, weight=self.weight, groups=x.shape[1], padding=self.padding))
-        x = F.conv2d(x, weight=self.weight, groups=x.shape[1], padding=self.padding)
-
-        mask = x >= self.threshold
-        x[mask] = 1.0
-        x[~mask] /= x[~mask].max()
-
-        return x, mask
-
-
-def remove_inner_mouth(seg, landmarks):
-    """ Removes the inner part of the mouth, corresponding to the face landmarks, from a binary mask.
-
-    Args:
-        seg (np.array): A binary mask of shape (H, W)
-        landmarks (np.array): Face landmarks of shape (98, 2)
-
-    Returns:
-        np.array: The binary mask with the inner part of the mouth removed.
-    """
-    size = np.array(seg.shape[::-1])
-    mouth_pts = landmarks[88:96] * size
-    mouth_pts = np.round(mouth_pts).astype(int)
-    out_seg = cv2.fillPoly(seg.astype('uint8'), [mouth_pts], (0, 0, 0))
-
-    return out_seg.astype(seg.dtype)
-
-
 def main(input_path):
     from PIL import Image
     seg = np.array(Image.open(input_path))
-    # while True:
-    #     random_hair_inpainting_mask(seg)
+    while True:
+        random_hair_inpainting_mask(seg)
 
 
 if __name__ == "__main__":
     # Parse program arguments
     import argparse
-
     parser = argparse.ArgumentParser('seg_utils')
     parser.add_argument('input', help='input path')
     args = parser.parse_args()

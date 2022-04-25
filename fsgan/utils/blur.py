@@ -52,6 +52,7 @@ class GaussianSmoothing(nn.Module):
         self.groups = channels
 
         if dim == 1:
+            nn.Conv2d()
             self.conv = F.conv1d
         elif dim == 2:
             self.conv = F.conv2d

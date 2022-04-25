@@ -2,15 +2,11 @@
 
 import os
 import shutil
-from functools import partial
 import torch
 import random
-import warnings
-import requests
-from tqdm import tqdm
-import torch.backends.cudnn as cudnn
 import torch.nn.init as init
-from fsgan.utils.obj_factory import extract_args, obj_factory
+import warnings
+import torch.backends.cudnn as cudnn
 
 
 def init_weights(m, init_type='normal', gain=0.02):
@@ -35,52 +31,9 @@ def init_weights(m, init_type='normal', gain=0.02):
             raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
         if hasattr(m, 'bias') and m.bias is not None:
             init.constant_(m.bias.data, 0.0)
-    elif classname.find('BatchNorm2d') != -1 or classname.find('BatchNorm3d') != -1:
+    elif classname.find('BatchNorm2d') != -1:
         init.normal_(m.weight.data, 1.0, gain)
         init.constant_(m.bias.data, 0.0)
-
-
-def set_device(gpus=None, use_cuda=True):
-    """ Sets computing device. Either the CPU or any of the available GPUs.
-
-    Args:
-        gpus (list of int, optional): The GPU ids to use. If not specified, all available GPUs will be used
-        use_cuda (bool, optional): If True, CUDA enabled GPUs will be used, else the CPU will be used
-
-    Returns:
-        torch.device: The selected computing device.
-    """
-    use_cuda = torch.cuda.is_available() if use_cuda else use_cuda
-    if use_cuda:
-        gpus = list(range(torch.cuda.device_count())) if not gpus else gpus
-        print('=> using GPU devices: {}'.format(', '.join(map(str, gpus))))
-    else:
-        gpus = None
-        print('=> using CPU device')
-    device = torch.device('cuda:{}'.format(gpus[0])) if gpus else torch.device('cpu')
-
-    return device, gpus
-
-
-def set_seed(seed):
-    """ Sets computing device. Either the CPU or any of the available GPUs.
-
-    Args:
-        gpus (list of int, optional): The GPU ids to use. If not specified, all available GPUs will be used
-        use_cuda (bool, optional): If True, CUDA enabled GPUs will be used, else the CPU will be used
-
-    Returns:
-        torch.device: The selected computing device.
-    """
-    if seed is not None:
-        random.seed(seed)
-        torch.manual_seed(seed)
-        cudnn.deterministic = True
-        warnings.warn('You have chosen to seed training. '
-                      'This will turn on the CUDNN deterministic setting, '
-                      'which can slow down your training considerably! '
-                      'You may see unexpected behavior when restarting '
-                      'from checkpoints.')
 
 
 def save_checkpoint(exp_dir, base_name, state, is_best=False):
@@ -98,6 +51,56 @@ def save_checkpoint(exp_dir, base_name, state, is_best=False):
         shutil.copyfile(filename, os.path.join(exp_dir, base_name + '_best.pth'))
 
 
+class ImagePool:
+    """ Defines an image pool for improving GAN training.
+
+    Given an image query, the images will be replaced with previous images with probability 0.5.
+
+    Args:
+        pool_size (int): The maximum number of images in the pool
+    """
+    def __init__(self, pool_size=50):
+        self.pool_size = pool_size
+        if self.pool_size > 0:
+            self.num_imgs = 0
+            self.images = []
+
+    def query(self, images):
+        if self.pool_size == 0:
+            return images
+        return_images = []
+        for image in images:
+            image = torch.unsqueeze(image.data, 0)
+            if self.num_imgs < self.pool_size:
+                self.num_imgs = self.num_imgs + 1
+                self.images.append(image)
+                return_images.append(image)
+            else:
+                p = random.uniform(0, 1)
+                if p > 0.5:
+                    random_id = random.randint(0, self.pool_size - 1)  # randint is inclusive
+                    tmp = self.images[random_id].clone()
+                    self.images[random_id] = image
+                    return_images.append(tmp)
+                else:
+                    return_images.append(image)
+        return_images = torch.cat(return_images, 0)
+        return return_images
+
+
+def next_pow2(n):
+    n += (n == 0)
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n
+
+
 mag_map = {'K': 3, 'M': 6, 'B': 9}
 
 
@@ -110,186 +113,87 @@ def str2int(s):
     return int(float(s[:-1]) * 10 ** mag_map[s[-1].upper()]) if s[-1].upper() in mag_map else int(s)
 
 
-def get_arch(obj, *args, **kwargs):
-    """ Extract the architecture (string representation) of an object given as a string or partial together
-    with additional provided arguments.
+def set_seed(seed):
+    """ Sets random seed for deterministic behaviour. """
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
+        cudnn.deterministic = True
+        warnings.warn('You have chosen to seed training. '
+                      'This will turn on the CUDNN deterministic setting, '
+                      'which can slow down your training considerably! '
+                      'You may see unexpected behavior when restarting '
+                      'from checkpoints.')
 
-    The returned architecture can be used to create the object using the obj_factory function.
+
+def set_device(gpus=None, use_cuda=None):
+    """ Sets computing device. Either the CPU or any of the available GPUs.
 
     Args:
-        obj (str or partial): The object string expresion or partial to be converted into an object
-        *args: Additional arguments to pass to the object
-        **kwargs: Additional keyword arguments to pass to the object
+        gpus (list of int, optional): The GPU ids to use. If not specified, all available GPUs will be used
+        use_cuda (bool, optional): If True, CUDA enabled GPUs will be used, else the CPU will be used
 
     Returns:
-        arch (str): The object's architecture (string representation).
+        torch.device: The selected computing device.
     """
-    obj_args, obj_kwargs = [], {}
-    if isinstance(obj, str):
-        if '(' in obj and ')' in obj:
-            arg_pos = obj.find('(')
-            func = obj[:arg_pos]
-            args_exp = obj[arg_pos:]
-            obj_args, obj_kwargs = eval('extract_args' + args_exp)
-        else:
-            func = obj
-    elif isinstance(obj, partial):
-        func = obj.func.__module__ + '.' + obj.func.__name__
-        obj_args, obj_kwargs = obj.args, obj.keywords
+    use_cuda = torch.cuda.is_available() if use_cuda is None else use_cuda
+    if use_cuda:
+        gpus = list(range(torch.cuda.device_count())) if not gpus else gpus
+        print('=> using GPU devices: {}'.format(', '.join(map(str, gpus))))
     else:
-        return None
+        gpus = None
+        print('=> using CPU device')
+    device = torch.device('cuda:{}'.format(gpus[0])) if gpus else torch.device('cpu')
 
-    # Concatenate arguments
-    obj_args = obj_args + args
-    obj_kwargs.update(kwargs)
-
-    # Convert object components to string representation
-    args = ",".join(map(repr, obj_args))
-    kwargs = ",".join("{}={!r}".format(k, v) for k, v in obj_kwargs.items())
-    comma = ',' if args != '' and kwargs != '' else ''
-    format_string = '{func}({args}{comma}{kwargs})'
-    arch = format_string.format(func=func, args=args, comma=comma, kwargs=kwargs).replace(' ', '')
-
-    return arch
+    return device, gpus
 
 
-def load_model(model_path, name='', device=None, arch=None, return_checkpoint=False, train=False):
-    """ Load a model from checkpoint.
+def topk_accuracy(output, target, topk=(1,)):
+    """ Computes the precision@k for the specified values of k. """
+    maxk = max(topk)
+    batch_size = target.size(0)
 
-    This is a utility function that combines the model weights and architecture (string representation) to easily
-    load any model without explicit knowledge of its class.
+    _, pred = output.topk(maxk, 1, True, True)
+    # pred    = pred.t()
+    pred = pred.view(batch_size, -1)
+    target.view(-1, 1).expand_as(pred)
 
-    Args:
-        model_path (str): Path to the model's checkpoint (.pth)
-        name (str): The name of the model (for printing and error management)
-        device (torch.device): The device to load the model to
-        arch (str): The model's architecture (string representation)
-        return_checkpoint (bool): If True, the checkpoint will be returned as well
-        train (bool): If True, the model will be set to train mode, else it will be set to test mode
+    # correct = pred.eq(target.view(1, -1).expand_as(pred))
+    correct = pred.eq(target.view(-1, 1).expand_as(pred))
 
-    Returns:
-        (nn.Module, dict (optional)): A tuple that contains:
-            - model (nn.Module): The loaded model
-            - checkpoint (dict, optional): The model's checkpoint (only if return_checkpoint is True)
-    """
-    assert model_path is not None, '%s model must be specified!' % name
-    assert os.path.exists(model_path), 'Couldn\'t find %s model in path: %s' % (name, model_path)
-    print('=> Loading %s model: "%s"...' % (name, os.path.basename(model_path)))
-    checkpoint = torch.load(model_path)
-    assert arch is not None or 'arch' in checkpoint, 'Couldn\'t determine %s model architecture!' % name
-    arch = checkpoint['arch'] if arch is None else arch
-    model = obj_factory(arch)
-    if device is not None:
-        model.to(device)
-    model.load_state_dict(checkpoint['state_dict'])
-    model.train(train)
-
-    if return_checkpoint:
-        return model, checkpoint
-    else:
-        return model
+    res = []
+    for k in topk:
+        # correct_k = correct[:k].view(-1).float().sum(0)
+        correct_k = correct[:, :k].view(-1).sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
 
 
-def random_pair(n, min_dist=1, index1=None):
-    """ Return a random pair of integers in the range [0, n) with a minimum distance between them.
+class AverageMeter(object):
+    """ Computes and stores the average and current value. """
+    def __init__(self):
+        self.reset()
 
-    Args:
-        n (int): Determine the range size
-        min_dist (int): The minimum distance between the random pair
-        index1 (int, optional): If specified, this will determine the first integer
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
 
-    Returns:
-        (int, int): The random pair of integers.
-    """
-    r1 = random.randint(0, n - 1) if index1 is None else index1
-    d_left = min(r1, min_dist)
-    d_right = min(n - 1 - r1, min_dist)
-    r2 = random.randint(0, n - 2 - d_left - d_right)
-    r2 = r2 + d_left + 1 + d_right if r2 >= (r1 - d_left) else r2
-
-    return r1, r2
-
-
-def random_pair_range(a, b, min_dist=1, index1=None):
-    """ Return a random pair of integers in the range [a, b] with a minimum distance between them.
-
-    Args:
-        a (int): The minimum number in the range
-        b (int): The maximum number in the range
-        min_dist (int): The minimum distance between the random pair
-        index1 (int, optional): If specified, this will determine the first integer
-
-    Returns:
-        (int, int): The random pair of integers.
-    """
-    r1 = random.randint(a, b) if index1 is None else index1
-    d_left = min(r1 - a, min_dist)
-    d_right = min(b - r1, min_dist)
-    r2 = random.randint(a, b - 1 - d_left - d_right)
-    r2 = r2 + d_left + 1 + d_right if r2 >= (r1 - d_left) else r2
-
-    return r1, r2
-
-
-# Adapted from: https://github.com/Sudy/coling2018/blob/master/torchtext/utils.py
-def download_from_url(url, output_path):
-    """ Download file from url including Google Drive.
-
-    Args:
-        url (str): File URL
-        output_path (str): Output path to write the file to
-    """
-    def process_response(r):
-        chunk_size = 16 * 1024
-        total_size = int(r.headers.get('Content-length', 0))
-        with open(output_path, "wb") as file:
-            with tqdm(total=total_size, unit='B', unit_scale=1, desc=os.path.split(output_path)[1]) as t:
-                for chunk in r.iter_content(chunk_size):
-                    if chunk:
-                        file.write(chunk)
-                        t.update(len(chunk))
-
-    if 'drive.google.com' not in url:
-        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True)
-        process_response(response)
-        return
-
-    # print('downloading from Google Drive; may take a few minutes')
-    confirm_token = None
-    session = requests.Session()
-    response = session.get(url, stream=True)
-    for k, v in response.cookies.items():
-        if k.startswith("download_warning"):
-            confirm_token = v
-
-    if confirm_token:
-        url = url + "&confirm=" + confirm_token
-        response = session.get(url, stream=True)
-
-    process_response(response)
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
 
 def main():
-    from torch.optim.lr_scheduler import StepLR
-    scheduler = partial(StepLR, step_size=10, gamma=0.5)
-    print(get_arch(scheduler))
-    scheduler = partial(StepLR, 10, 0.5)
-    print(get_arch(scheduler))
-    scheduler = partial(StepLR, 10, gamma=0.5)
-    print(get_arch(scheduler))
-    scheduler = partial(StepLR)
-    print(get_arch(scheduler))
-    print(get_arch(scheduler, 10, gamma=0.5))
+    import torch
 
-    scheduler = 'torch.optim.lr_scheduler.StepLR(step_size=10,gamma=0.5)'
-    print(get_arch(scheduler))
-    scheduler = 'torch.optim.lr_scheduler.StepLR(10,0.5)'
-    print(get_arch(scheduler))
-    scheduler = 'torch.optim.lr_scheduler.StepLR(10,gamma=0.5)'
-    print(get_arch(scheduler))
-    scheduler = 'torch.optim.lr_scheduler.StepLR()'
-    print(get_arch(scheduler))
-    print(get_arch(scheduler, 10, gamma=0.5))
+    output = torch.rand(2, 10, 1, 1)
+    target = torch.LongTensor(range(2))
+    acc = topk_accuracy(output, target, topk=(1, 5))
+    print(acc)
 
 
 if __name__ == "__main__":
